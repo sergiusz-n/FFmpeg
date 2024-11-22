@@ -325,9 +325,10 @@ int av_hwframe_ctx_init(AVBufferRef *ref)
     AVHWFramesContext *ctx  = &ctxi->p;
     const enum AVPixelFormat *pix_fmt;
     int ret;
-
+    av_log(ctx, AV_LOG_TRACE, "av_hwframe_ctx_init: enter");
     if (ctxi->source_frames) {
         /* A derived frame context is already initialised. */
+        av_log(ctx, AV_LOG_TRACE, "av_hwframe_ctx_init: already initialized");
         return 0;
     }
 
@@ -359,6 +360,7 @@ int av_hwframe_ctx_init(AVBufferRef *ref)
         ctx->pool = ctxi->pool_internal;
 
     /* preallocate the frames in the pool, if requested */
+    av_log(ctx, AV_LOG_TRACE, "av_hwframe_ctx_init: prealloc ctx->initial_pool_size = %d", ctx->initial_pool_size);
     if (ctx->initial_pool_size > 0) {
         ret = hwframe_pool_prealloc(ref);
         if (ret < 0)

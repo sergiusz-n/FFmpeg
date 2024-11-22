@@ -66,6 +66,7 @@ typedef struct CuvidContext
     int drop_second_field;
     char *crop_expr;
     char *resize_expr;
+    char *max_frame_expr;
 
     struct {
         int left;
@@ -78,6 +79,11 @@ typedef struct CuvidContext
         int width;
         int height;
     } resize;
+
+    struct {
+        int width;
+        int height;
+    } max;
 
     AVBufferRef *hwdevice;
     AVBufferRef *hwframe;
@@ -128,6 +134,7 @@ static int CUDAAPI cuvid_handle_video_sequence(void *opaque, CUVIDEOFORMAT* form
     AVHWFramesContext *hwframe_ctx = (AVHWFramesContext*)ctx->hwframe->data;
     CUVIDDECODECAPS *caps = NULL;
     CUVIDDECODECREATEINFO cuinfo;
+    CUVIDRECONFIGUREDECODERINFO cureconfiginfo;
     int surface_fmt;
     int chroma_444;
     int fifo_size_inc;
@@ -139,9 +146,16 @@ static int CUDAAPI cuvid_handle_video_sequence(void *opaque, CUVIDEOFORMAT* form
                                        AV_PIX_FMT_NONE,  // Will be updated below
                                        AV_PIX_FMT_NONE };
 
-    av_log(avctx, AV_LOG_TRACE, "pfnSequenceCallback, progressive_sequence=%d\n", format->progressive_sequence);
-
+    av_log(avctx, AV_LOG_TRACE,
+        "pfnSequenceCallback, progressive_sequence=%d\n", format->progressive_sequence);
+    av_log(avctx, AV_LOG_TRACE,
+        "pfnSequenceCallback, dimension=%dx%d\n", format->coded_width, format->coded_height);
+    av_log(avctx, AV_LOG_TRACE,
+        "pfnSequenceCallback, format->display_area={%d, %d, %d, %d}\n",
+        format->display_area.left, format->display_area.top, format->display_area.right, format->display_area.bottom);
+    fflush(stderr);
     memset(&cuinfo, 0, sizeof(cuinfo));
+    memset(&cureconfiginfo, 0, sizeof(cureconfiginfo));
 
     ctx->internal_error = 0;
 
@@ -268,6 +282,45 @@ static int CUDAAPI cuvid_handle_video_sequence(void *opaque, CUVIDEOFORMAT* form
         return 1;
 
     if (ctx->cudecoder) {
+        av_log(avctx, AV_LOG_DEBUG, "resolution changed: %dx%d -> %dx%d. [max: %dx%d]\n",
+            old_width, old_height, avctx->width, avctx->height, ctx->max.width, ctx->max.height);
+    }
+
+    if (ctx->cudecoder
+            && avctx->width <= ctx->max.width
+            && avctx->height <= ctx->max.height
+            && ctx->chroma_format == format->chroma_format
+            && ctx->codec_type == format->codec) {
+        av_log(avctx, AV_LOG_TRACE, "Reconfiguring decoder: nb_surfaces = %d format->min_num_decode_surfaces + 3 = %d\n",
+            ctx->nb_surfaces, format->min_num_decode_surfaces + 3);
+
+
+        // apply cropping
+        cureconfiginfo.display_area.left = cuinfo.display_area.left;
+        cureconfiginfo.display_area.top = cuinfo.display_area.top;
+        cureconfiginfo.display_area.right = cuinfo.display_area.right;
+        cureconfiginfo.display_area.bottom = cuinfo.display_area.bottom;
+
+        // aspect ratio conversion, 1:1, depends on scaled resolution
+        cureconfiginfo.target_rect.left = cuinfo.target_rect.left;
+        cureconfiginfo.target_rect.top = cuinfo.target_rect.top;
+        cureconfiginfo.target_rect.right = cuinfo.target_rect.right;
+        cureconfiginfo.target_rect.bottom = cuinfo.target_rect.bottom;
+
+        cureconfiginfo.ulWidth = cuinfo.ulWidth;
+        cureconfiginfo.ulHeight = cuinfo.ulHeight;
+        cureconfiginfo.ulTargetWidth = cuinfo.ulTargetWidth;
+        cureconfiginfo.ulTargetHeight = cuinfo.ulTargetHeight;
+
+        cureconfiginfo.ulNumDecodeSurfaces = ctx->nb_surfaces;
+
+        ctx->internal_error = CHECK_CU(ctx->cvdl->cuvidReconfigureDecoder(ctx->cudecoder, &cureconfiginfo));
+        return (ctx->internal_error < 0) ? 0 : 1;
+    }
+
+
+
+    if (ctx->cudecoder) {
         av_log(avctx, AV_LOG_TRACE, "Re-initializing decoder\n");
         ctx->internal_error = CHECK_CU(ctx->cvdl->cuvidDestroyDecoder(ctx->cudecoder));
         if (ctx->internal_error < 0)
@@ -335,6 +388,9 @@ static int CUDAAPI cuvid_handle_video_sequence(void *opaque, CUVIDEOFORMAT* form
         return 0;
     }
 
+    cuinfo.ulMaxWidth = ctx->max.width = ctx->max_frame_expr ? ctx->max.width : cuinfo.ulWidth;
+    cuinfo.ulMaxHeight = ctx->max.height = ctx->max_frame_expr ? ctx->max.height : cuinfo.ulHeight;
+
     cuinfo.ulNumDecodeSurfaces = ctx->nb_surfaces;
     cuinfo.ulNumOutputSurfaces = 1;
     cuinfo.ulCreationFlags = cudaVideoCreate_PreferCUVID;
@@ -351,9 +407,10 @@ static int CUDAAPI cuvid_handle_video_sequence(void *opaque, CUVIDEOFORMAT* form
     if (!hwframe_ctx->pool) {
         hwframe_ctx->format = AV_PIX_FMT_CUDA;
         hwframe_ctx->sw_format = avctx->sw_pix_fmt;
-        hwframe_ctx->width = avctx->width;
-        hwframe_ctx->height = avctx->height;
+        hwframe_ctx->width = ctx->max.width;
+        hwframe_ctx->height = ctx->max.height;
 
+        av_log(avctx, AV_LOG_TRACE, "pfnSequenceCallback, do av_hwframe_ctx_init\n");
         if ((ctx->internal_error = av_hwframe_ctx_init(ctx->hwframe)) < 0) {
             av_log(avctx, AV_LOG_ERROR, "av_hwframe_ctx_init failed\n");
             return 0;
@@ -373,7 +430,10 @@ static int CUDAAPI cuvid_handle_picture_decode(void *opaque, CUVIDPICPARAMS* pic
     AVCodecContext *avctx = opaque;
     CuvidContext *ctx = avctx->priv_data;
 
-    av_log(avctx, AV_LOG_TRACE, "pfnDecodePicture\n");
+    av_log(avctx, AV_LOG_TRACE, "pfnDecodePicture, ctx->cudecoder = %p\n", ctx->cudecoder);
+
+    av_log(avctx, AV_LOG_TRACE, "pfnDecodePicture, picparams.CurrPicIdx=%d picparams.PicWidthInMbs=%d picparams.FrameHeightInMbs=%d\n",
+        picparams->CurrPicIdx, picparams->PicWidthInMbs, picparams->FrameHeightInMbs);
 
     if(picparams->intra_pic_flag)
         ctx->key_frame[picparams->CurrPicIdx] = picparams->intra_pic_flag;
@@ -394,6 +454,8 @@ static int CUDAAPI cuvid_handle_picture_display(void *opaque, CUVIDPARSERDISPINF
     parsed_frame.dispinfo = *dispinfo;
     ctx->internal_error = 0;
 
+    av_log(avctx, AV_LOG_TRACE, "cuvid_handle_picture_display, dispinfo.picture_index = %d dispinfo.timestamp = %lld\n",
+        dispinfo->picture_index, dispinfo->timestamp);
     // For some reason, dispinfo->progressive_frame is sometimes wrong.
     parsed_frame.dispinfo.progressive_frame = ctx->progressive_sequence;
 
@@ -526,6 +588,7 @@ static int cuvid_output_frame(AVCodecContext *avctx, AVFrame *frame)
     if (av_fifo_read(ctx->frame_queue, &parsed_frame, 1) >= 0) {
         const AVPixFmtDescriptor *pixdesc;
         CUVIDPROCPARAMS params;
+        CUVIDGETDECODESTATUS decodeStatus;
         unsigned int pitch = 0;
         int offset = 0;
         int i;
@@ -534,6 +597,13 @@ static int cuvid_output_frame(AVCodecContext *avctx, AVFrame *frame)
         params.progressive_frame = parsed_frame.dispinfo.progressive_frame;
         params.second_field = parsed_frame.second_field;
         params.top_field_first = parsed_frame.dispinfo.top_field_first;
+
+
+        CHECK_CU(ctx->cvdl->cuvidGetDecodeStatus(ctx->cudecoder, parsed_frame.dispinfo.picture_index, &decodeStatus));
+        av_log(avctx, AV_LOG_TRACE, "cuvid_output_frame: dispinfo.timestamp = %lld dispinfo.picture_index = %d decodeStatus = %d\n",
+            parsed_frame.dispinfo.timestamp,
+            parsed_frame.dispinfo.picture_index,
+            decodeStatus.decodeStatus);
 
         ret = CHECK_CU(ctx->cvdl->cuvidMapVideoFrame(ctx->cudecoder, parsed_frame.dispinfo.picture_index, &mapped_frame, &pitch, &params));
         if (ret < 0)
@@ -609,6 +679,10 @@ static int cuvid_output_frame(AVCodecContext *avctx, AVFrame *frame)
                 tmp_frame->data[i]     = (uint8_t*)mapped_frame + offset;
                 tmp_frame->linesize[i] = pitch;
                 offset += pitch * (avctx->height >> (i ? pixdesc->log2_chroma_h : 0));
+
+                av_log(avctx, AV_LOG_TRACE, "cuvid_output_frame: tmp_frame->data[%d]=%p tmp_frame->linesize[%d] = %d\n",
+                    i, tmp_frame->data[i],
+                    i, tmp_frame->linesize[i]);
             }
 
             ret = ff_get_buffer(avctx, frame, 0);
@@ -623,6 +697,12 @@ static int cuvid_output_frame(AVCodecContext *avctx, AVFrame *frame)
                 av_log(avctx, AV_LOG_ERROR, "av_hwframe_transfer_data failed\n");
                 av_frame_free(&tmp_frame);
                 goto error;
+            }
+
+            for (i = 0; i < pixdesc->nb_components; i++) {
+                av_log(avctx, AV_LOG_TRACE, "cuvid_output_frame: frame->linesize[%d] = %d frame->data[%d] = %.2x\n",
+                    i, frame->linesize[i],
+                    i, frame->data[i] ? frame->data[i][0] : 0xff);
             }
             av_frame_free(&tmp_frame);
         } else {
@@ -867,6 +947,13 @@ static av_cold int cuvid_decode_init(AVCodecContext *avctx)
                                  &ctx->crop.top, &ctx->crop.bottom,
                                  &ctx->crop.left, &ctx->crop.right) != 4) {
         av_log(avctx, AV_LOG_ERROR, "Invalid cropping expressions\n");
+        ret = AVERROR(EINVAL);
+        goto error;
+    }
+
+    if (ctx->max_frame_expr && sscanf(ctx->max_frame_expr, "%dx%d",
+                                &ctx->max.width, &ctx->max.height) != 2) {
+        av_log(avctx, AV_LOG_ERROR, "Invalid max frame expressions\n");
         ret = AVERROR(EINVAL);
         goto error;
     }
@@ -1136,6 +1223,7 @@ static const AVOption options[] = {
     { "drop_second_field", "Drop second field when deinterlacing", OFFSET(drop_second_field), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, VD },
     { "crop",     "Crop (top)x(bottom)x(left)x(right)", OFFSET(crop_expr), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, VD },
     { "resize",   "Resize (width)x(height)", OFFSET(resize_expr), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, VD },
+    { "max_frame","Coded sequence max (width)x(height)", OFFSET(max_frame_expr), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, VD },
     { NULL }
 };
 

@@ -40,11 +40,10 @@ static inline int ff_cuda_check(void *avctx,
 
     if (err == CUDA_SUCCESS)
         return 0;
-
     ((cuda_check_GetErrorName *)cuGetErrorName_fn)(err, &err_name);
     ((cuda_check_GetErrorString *)cuGetErrorString_fn)(err, &err_string);
 
-    av_log(avctx, AV_LOG_ERROR, "%s failed", func);
+    av_log(avctx, AV_LOG_ERROR, "%s failed err = %d", func, err);
     if (err_name && err_string)
         av_log(avctx, AV_LOG_ERROR, " -> %s: %s", err_name, err_string);
     av_log(avctx, AV_LOG_ERROR, "\n");
