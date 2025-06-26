@@ -27,11 +27,14 @@
 #include "libavutil/timestamp.h"
 #include "libavcodec/codec_desc.h"
 #include "libavcodec/bsf.h"
+#include "libavcodec/avcodec.h"
 #include "avformat.h"
 #include "avio_internal.h"
 #include "demux.h"
 #include "internal.h"
 #include "url.h"
+#include <stdbool.h>
+#include <float.h>
 
 typedef enum ConcatMatchMode {
     MATCH_ONE_TO_ONE,
@@ -41,6 +44,7 @@ typedef enum ConcatMatchMode {
 typedef struct ConcatStream {
     AVBSFContext *bsf;
     int out_stream_index;
+    AVRational source_tbn;
 } ConcatStream;
 
 typedef struct {
@@ -71,6 +75,8 @@ typedef struct {
     ConcatMatchMode stream_match_mode;
     unsigned auto_convert;
     int segment_time_metadata;
+    AVRational audio_tbn;
+    AVRational video_tbn;
 } ConcatContext;
 
 static int concat_probe(const AVProbeData *probe)
@@ -205,6 +211,24 @@ static int detect_stream_specific(AVFormatContext *avf, int idx)
     const AVBitStreamFilter *filter;
     AVBSFContext *bsf;
     int ret;
+    unsigned fileno = cat->cur_file - cat->files;
+
+    cs->source_tbn = st->time_base;
+    if (st->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
+        if (cat->audio_tbn.num == 0) {
+            cat->audio_tbn = st->time_base;
+            av_log(cat->avf, AV_LOG_INFO, "Common AUDIO tbn set to %d/%d\n", cat->audio_tbn.num, cat->audio_tbn.den);
+        }
+        st->time_base = cat->audio_tbn;
+    }
+
+    if (st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+        if (cat->video_tbn.num == 0) {
+            cat->video_tbn = st->time_base;
+            av_log(cat->avf, AV_LOG_INFO, "Common VIDEO tbn set to %d/%d\n", cat->video_tbn.num, cat->video_tbn.den);
+        }
+        st->time_base = cat->video_tbn;
+    }
 
     if (cat->auto_convert && st->codecpar->codec_id == AV_CODEC_ID_H264) {
         if (!st->codecpar->extradata_size                                                ||
@@ -212,7 +236,7 @@ static int detect_stream_specific(AVFormatContext *avf, int idx)
             (st->codecpar->extradata_size >= 4 && AV_RB32(st->codecpar->extradata) == 1))
             return 0;
         av_log(cat->avf, AV_LOG_INFO,
-               "Auto-inserting h264_mp4toannexb bitstream filter\n");
+               "Auto-inserting h264_mp4toannexb bitstream filter for fileno = %d\n", fileno);
         filter = av_bsf_get_by_name("h264_mp4toannexb");
         if (!filter) {
             av_log(avf, AV_LOG_ERROR, "h264_mp4toannexb bitstream filter "
@@ -222,6 +246,10 @@ static int detect_stream_specific(AVFormatContext *avf, int idx)
         ret = av_bsf_alloc(filter, &bsf);
         if (ret < 0)
             return ret;
+
+        if (cs->bsf)
+            av_bsf_free(&cs->bsf);
+
         cs->bsf = bsf;
 
         ret = avcodec_parameters_copy(bsf->par_in, st->codecpar);
@@ -287,6 +315,7 @@ static int match_streams(AVFormatContext *avf)
     ConcatStream *map;
     int i, ret;
 
+
     if (cat->cur_file->nb_streams >= cat->avf->nb_streams)
         return 0;
     map = av_realloc(cat->cur_file->streams,
@@ -328,7 +357,18 @@ static int64_t get_best_effort_duration(ConcatFile *file, AVFormatContext *avf)
         return avf->duration - (file->file_inpoint - file->file_start_time);
     if (file->next_dts != AV_NOPTS_VALUE)
         return file->next_dts - file->file_inpoint;
+
     return AV_NOPTS_VALUE;
+}
+
+static void free_concat_streams(ConcatFile *file) {
+    unsigned i;
+    for (i = 0; i < file->nb_streams; i++) {
+        if (file->streams[i].bsf)
+            av_bsf_free(&file->streams[i].bsf);
+    }
+    av_freep(&file->streams);
+    file->nb_streams = 0;
 }
 
 static int open_file(AVFormatContext *avf, unsigned fileno)
@@ -362,6 +402,8 @@ static int open_file(AVFormatContext *avf, unsigned fileno)
         avformat_close_input(&cat->avf);
         return ret;
     }
+    av_log(avf, AV_LOG_DEBUG, "open_file: url = %s\n", file->url);
+
     if (options) {
         av_log(avf, AV_LOG_WARNING, "Unused options for '%s'.\n", file->url);
         /* TODO log unused options once we have a proper string API */
@@ -374,6 +416,8 @@ static int open_file(AVFormatContext *avf, unsigned fileno)
     file->file_start_time = (cat->avf->start_time == AV_NOPTS_VALUE) ? 0 : cat->avf->start_time;
     file->file_inpoint = (file->inpoint == AV_NOPTS_VALUE) ? file->file_start_time : file->inpoint;
     file->duration = get_best_effort_duration(file, cat->avf);
+
+    free_concat_streams(file);
 
     if (cat->segment_time_metadata) {
         av_dict_set_int(&file->metadata, "lavf.concatdec.start_time", file->start_time, 0);
@@ -393,15 +437,13 @@ static int open_file(AVFormatContext *avf, unsigned fileno)
 static int concat_read_close(AVFormatContext *avf)
 {
     ConcatContext *cat = avf->priv_data;
-    unsigned i, j;
+    unsigned i;
 
     for (i = 0; i < cat->nb_files; i++) {
         av_freep(&cat->files[i].url);
-        for (j = 0; j < cat->files[i].nb_streams; j++) {
-            if (cat->files[i].streams[j].bsf)
-                av_bsf_free(&cat->files[i].streams[j].bsf);
-        }
-        av_freep(&cat->files[i].streams);
+
+        free_concat_streams(&cat->files[i]);
+
         av_dict_free(&cat->files[i].metadata);
         av_dict_free(&cat->files[i].options);
     }
@@ -658,6 +700,7 @@ static int concat_read_header(AVFormatContext *avf)
     unsigned i;
     int ret;
 
+
     ret = concat_parse_script(avf);
     if (ret < 0)
         return ret;
@@ -682,6 +725,11 @@ static int concat_read_header(AVFormatContext *avf)
         if (time + (uint64_t)cat->files[i].user_duration > INT64_MAX)
             return AVERROR_INVALIDDATA;
         time += cat->files[i].user_duration;
+        av_log(avf, AV_LOG_INFO, "file = %d start_time = %ld duration = %ld\n",
+            i,
+            cat->files[i].start_time,
+            cat->files[i].duration
+        );
     }
     if (i == cat->nb_files) {
         avf->duration = time;
@@ -707,6 +755,11 @@ static int open_next_file(AVFormatContext *avf)
         cat->eof = 1;
         return AVERROR_EOF;
     }
+    av_log(avf, AV_LOG_INFO, "open_next_file: fileno = %d start_time = %ld duration = %ld\n",
+        fileno,
+        cat->cur_file->start_time,
+        cat->cur_file->duration
+    );
     return open_file(avf, fileno);
 }
 
@@ -752,6 +805,9 @@ static int concat_read_packet(AVFormatContext *avf, AVPacket *pkt)
     ConcatStream *cs;
     AVStream *st;
     FFStream *sti;
+    static ConcatFile *last_file = NULL;
+    static bool new_audio = false;
+    static bool new_video = false;
 
     if (cat->eof)
         return AVERROR_EOF;
@@ -789,21 +845,65 @@ static int concat_read_packet(AVFormatContext *avf, AVPacket *pkt)
 
     st = cat->avf->streams[pkt->stream_index];
     sti = ffstream(st);
-    av_log(avf, AV_LOG_DEBUG, "file:%d stream:%d pts:%s pts_time:%s dts:%s dts_time:%s",
+
+    new_audio = new_audio || (last_file != cat->cur_file);
+    new_video = new_video || (last_file != cat->cur_file);
+    // av_log(avf, AV_LOG_WARNING, "  ===> extradata = %p, extradata_size = %d\n",  sti->avctx->extradata, sti->avctx->extradata_size);
+    if (new_audio && st->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
+        // av_log(avf, AV_LOG_INFO, "samplerate = %d\n",  st->codecpar->sample_rate);
+        // av_log(avf, AV_LOG_INFO, "extradata = %p, extradata_size = %d\n",  sti->avctx->extradata, sti->avctx->extradata_size);
+        ff_add_param_change(pkt, st->codecpar->ch_layout.nb_channels, 0, st->codecpar->sample_rate, 0, 0);
+        void *new_extradata = av_memdup(sti->avctx->extradata, sti->avctx->extradata_size);
+        av_packet_add_side_data(pkt, AV_PKT_DATA_NEW_EXTRADATA,
+                                new_extradata,
+                                sti->avctx->extradata_size);
+        new_audio = false;
+    }
+    if (new_video && st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+        // void *new_extradata = av_memdup(sti->avctx->extradata, sti->avctx->extradata_size);
+        // av_packet_add_side_data(pkt, AV_PKT_DATA_NEW_EXTRADATA,
+        //                         new_extradata,
+        //                         sti->avctx->extradata_size);
+        new_video = false;
+    }
+
+    av_log(avf, AV_LOG_DEBUG, "file:%d stream:%d pts:%s pts_time:%s dts:%s dts_time:%s (tbn: %d/%d)",
            (unsigned)(cat->cur_file - cat->files), pkt->stream_index,
            av_ts2str(pkt->pts), av_ts2timestr(pkt->pts, &st->time_base),
-           av_ts2str(pkt->dts), av_ts2timestr(pkt->dts, &st->time_base));
+           av_ts2str(pkt->dts), av_ts2timestr(pkt->dts, &st->time_base),
+           st->time_base.num, st->time_base.den);
 
-    delta = av_rescale_q(cat->cur_file->start_time - cat->cur_file->file_inpoint,
-                         AV_TIME_BASE_Q,
-                         cat->avf->streams[pkt->stream_index]->time_base);
-    if (pkt->pts != AV_NOPTS_VALUE)
-        pkt->pts += delta;
-    if (pkt->dts != AV_NOPTS_VALUE)
-        pkt->dts += delta;
-    av_log(avf, AV_LOG_DEBUG, " -> pts:%s pts_time:%s dts:%s dts_time:%s\n",
+
+    AVRational cur_time_base = cs->source_tbn;
+    AVRational common_time_base = st->codecpar->codec_type == AVMEDIA_TYPE_AUDIO
+            ? cat->audio_tbn
+            : cat->video_tbn;
+    //if (1) {
+    if (0 == av_cmp_q(common_time_base, cur_time_base)) {
+        delta = av_rescale_q(cat->cur_file->start_time - cat->cur_file->file_inpoint,
+                             AV_TIME_BASE_Q,
+                             cat->avf->streams[pkt->stream_index]->time_base);
+        if (pkt->pts != AV_NOPTS_VALUE)
+            pkt->pts += delta;
+        if (pkt->dts != AV_NOPTS_VALUE)
+            pkt->dts += delta;
+    } else {
+
+        delta = av_rescale_q(cat->cur_file->start_time - cat->cur_file->file_inpoint,
+                            AV_TIME_BASE_Q,
+                            common_time_base);
+        if (pkt->pts != AV_NOPTS_VALUE)
+            pkt->pts = av_rescale_q(pkt->pts, cur_time_base, common_time_base) + delta;
+        if (pkt->dts != AV_NOPTS_VALUE)
+            pkt->dts = av_rescale_q(pkt->dts, cur_time_base, common_time_base) + delta;
+
+    }
+
+    av_log(avf, AV_LOG_DEBUG, " -> pts:%s pts_time:%s dts:%s dts_time:%s (tbn: %d/%d)\n",
            av_ts2str(pkt->pts), av_ts2timestr(pkt->pts, &st->time_base),
-           av_ts2str(pkt->dts), av_ts2timestr(pkt->dts, &st->time_base));
+           av_ts2str(pkt->dts), av_ts2timestr(pkt->dts, &st->time_base),
+           common_time_base.num, common_time_base.den
+    );
     if (cat->cur_file->metadata) {
         size_t metadata_len;
         char* packed_metadata = av_packet_pack_dictionary(cat->cur_file->metadata, &metadata_len);
@@ -825,6 +925,8 @@ static int concat_read_packet(AVFormatContext *avf, AVPacket *pkt)
     }
 
     pkt->stream_index = cs->out_stream_index;
+
+    last_file = cat->cur_file;
     return 0;
 }
 
@@ -843,6 +945,7 @@ static int try_seek(AVFormatContext *avf, int stream,
         ff_rescale_interval(AV_TIME_BASE_Q, cat->avf->streams[stream]->time_base,
                             &min_ts, &ts, &max_ts);
     }
+
     return avformat_seek_file(cat->avf, stream, min_ts, ts, max_ts, flags);
 }
 
@@ -858,7 +961,6 @@ static int real_seek(AVFormatContext *avf, int stream,
         ff_rescale_interval(avf->streams[stream]->time_base, AV_TIME_BASE_Q,
                             &min_ts, &ts, &max_ts);
     }
-
     left  = 0;
     right = cat->nb_files;
 
@@ -933,6 +1035,10 @@ static const AVOption options[] = {
       OFFSET(auto_convert), AV_OPT_TYPE_BOOL, {.i64 = 1}, 0, 1, DEC },
     { "segment_time_metadata", "output file segment start time and duration as packet metadata",
       OFFSET(segment_time_metadata), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, DEC },
+    { "audio_tbn", NULL,
+      OFFSET(audio_tbn), AV_OPT_TYPE_RATIONAL, { .dbl = 0 }, 0, DBL_MAX, DEC },
+    { "video_tbn", NULL,
+      OFFSET(video_tbn), AV_OPT_TYPE_RATIONAL, { .dbl = 0 }, 0, DBL_MAX, DEC },
     { NULL }
 };
 
